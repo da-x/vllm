@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -18,8 +19,17 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.request import Request
+from vllm.utils import PlaceholderModule
 
 logger = init_logger(__name__)
+
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+except ImportError:
+    fastsafetensors = PlaceholderModule("fastsafetensors")
+    SafeTensorsFileLoader = fastsafetensors.placeholder_attr(
+        "SafeTensorsFileLoader")
+    SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 
 @dataclass
@@ -148,23 +158,49 @@ class SharedStorageConnector(KVConnectorBase_V1):
                 "In connector.start_load_kv, but the attn_metadata is None")
             return
 
+        if torch.distributed.is_initialized():
+            pg = torch.distributed.group.WORLD
+        else:
+            pg = SingleGroup()
+
+        device = torch.device(f'cuda:{pg.rank()}')
         # Load the KV for each request each layer
         for request in metadata.requests:
             if request.is_store:
                 continue
+
+            inject_start = time.time()
             logger.info("Inject KV cache of %d tokens to the paged memory",
                         len(request.slot_mapping))
-            for layer_name in forward_context.no_compile_layers:
-                attn_layer = forward_context.no_compile_layers[layer_name]
-                kv_cache_layer = attn_layer.kv_cache[\
-                        forward_context.virtual_engine]
 
+            # Load the KV for each request each layer
+            loader = SafeTensorsFileLoader(pg, device)
+
+            filenames = []
+            for layer_name in forward_context.no_compile_layers:
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids)
-                kv_cache = safetensors.torch.load_file(
-                    filename)["kv_cache"].cuda()
-                inject_kv_into_layer(kv_cache_layer, kv_cache,
-                                     request.slot_mapping)
+                filenames.append(filename)
+
+            loader.add_filenames({0: filenames})
+            try:
+                fb = loader.copy_files_to_device()
+                for layer_name in forward_context.no_compile_layers:
+                    attn_layer = forward_context.no_compile_layers[layer_name]
+                    kv_cache_layer = attn_layer.kv_cache[\
+                            forward_context.virtual_engine]
+                    kv_cache = fb.get_tensor(layer_name)
+                    inject_kv_into_layer(kv_cache_layer, kv_cache,
+                                        request.slot_mapping)
+                try:
+                    pass
+                finally:
+                    fb.close()
+            finally:
+                loader.close()
+
+            inject_end = time.time()
+            logger.info("Injection done (%.4f seconds)", inject_end - inject_start)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -216,9 +252,11 @@ class SharedStorageConnector(KVConnectorBase_V1):
             if request.is_store:
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids)
+                if os.path.exists(filename):
+                    continue
                 kv_cache = extract_kv_from_layer(kv_layer,
                                                  request.slot_mapping)
-                tensors = {"kv_cache": kv_cache.detach().cpu()}
+                tensors = {layer_name: kv_cache.detach().cpu()}
                 safetensors.torch.save_file(tensors, filename)
 
     def wait_for_save(self):
