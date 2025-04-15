@@ -18,8 +18,17 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.request import Request
+from vllm.utils import PlaceholderModule
 
 logger = init_logger(__name__)
+
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+except ImportError:
+    fastsafetensors = PlaceholderModule("fastsafetensors")
+    SafeTensorsFileLoader = fastsafetensors.placeholder_attr(
+        "SafeTensorsFileLoader")
+    SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 
 @dataclass
@@ -148,21 +157,44 @@ class SharedStorageConnector(KVConnectorBase_V1):
                 "In connector.start_load_kv, but the attn_metadata is None")
             return
 
+        if torch.distributed.is_initialized():
+            pg = torch.distributed.group.WORLD
+        else:
+            pg = SingleGroup()
+
+        device = torch.device(f'cuda:{pg.rank()}')
         # Load the KV for each request each layer
         for request in metadata.requests:
             if request.is_store:
                 continue
+
             logger.info("Inject KV cache of %d tokens to the paged memory",
                         len(request.slot_mapping))
+
+            # Load the KV for each request each layer
+            loader = SafeTensorsFileLoader(pg, device)
+
+            filenames = []
+            for layer_name in forward_context.no_compile_layers:
+                filename = self._generate_filename_debug(
+                    layer_name, request.token_ids)
+                filenames.push(filename)
+
+            loader.add_filenames({pg.rank(): filenames})
+            try:
+                fb = loader.copy_files_to_device()
+                try:
+                    pass
+                finally:
+                    fb.close()
+            finally:
+                loader.close()
+
             for layer_name in forward_context.no_compile_layers:
                 attn_layer = forward_context.no_compile_layers[layer_name]
                 kv_cache_layer = attn_layer.kv_cache[\
                         forward_context.virtual_engine]
-
-                filename = self._generate_filename_debug(
-                    layer_name, request.token_ids)
-                kv_cache = safetensors.torch.load_file(
-                    filename)["kv_cache"].cuda()
+                kv_cache = fb.get_tensor(layer_name)
                 inject_kv_into_layer(kv_cache_layer, kv_cache,
                                      request.slot_mapping)
 
@@ -215,7 +247,7 @@ class SharedStorageConnector(KVConnectorBase_V1):
                     layer_name, request.token_ids)
                 kv_cache = extract_kv_from_layer(kv_layer,
                                                  request.slot_mapping)
-                tensors = {"kv_cache": kv_cache.detach().cpu()}
+                tensors = {layer_name: kv_cache.detach().cpu()}
                 safetensors.torch.save_file(tensors, filename)
 
     def wait_for_save(self):
