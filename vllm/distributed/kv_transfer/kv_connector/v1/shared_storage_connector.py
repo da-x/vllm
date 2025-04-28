@@ -190,6 +190,9 @@ class SharedStorageConnector(KVConnectorBase_V1):
             **kwargs: additional arguments for the save operation.
         """
 
+        if self._check_disable_put():
+            return False
+
         def extract_kv_from_layer(
             layer: torch.Tensor,
             slot_mapping: torch.Tensor,
@@ -341,6 +344,9 @@ class SharedStorageConnector(KVConnectorBase_V1):
     ) -> bool:
         """Check if the cache is hit for the request.
         """
+        if self._check_disable_get():
+            return False
+
         num_tokens_to_check = align_to_block_size(
             len(request.prompt_token_ids) - 1, self._block_size)
         foldername = self._generate_foldername_debug(torch.tensor(
@@ -376,6 +382,22 @@ class SharedStorageConnector(KVConnectorBase_V1):
                                                      create_folder=True)
         return os.path.join(foldername, f"{layer_name}.safetensors")
 
+    def _check_disable_put(
+        self,
+    ) -> bool:
+        """Generate a file name based on the layer name and the hash 
+        of the bytes of the input ids.
+        """
+        return os.path.exists(os.path.join(self._storage_path, "disable-put"))
+
+
+    def _check_disable_get(
+        self,
+    ) -> bool:
+        """Generate a file name based on the layer name and the hash 
+        of the bytes of the input ids.
+        """
+        return os.path.exists(os.path.join(self._storage_path, "disable-get"))
 
 def align_to_block_size(num_tokens: int, block_size) -> int:
     """Align the number of tokens to the block size.
